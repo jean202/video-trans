@@ -100,7 +100,21 @@ python3 video_ocr.py input.MOV \
 
 - `--interval`: 몇 초마다 프레임을 샘플링할지 지정
 - `--lang`: Tesseract 언어 코드. 현재 설치된 언어는 `tesseract --list-langs`로 확인
+- `--min-word-confidence`: 단어 confidence가 낮은 OCR 토큰을 버려 특수문자 노이즈를 줄임
+- `--char-whitelist`: 허용 문자 집합을 직접 지정하고 싶을 때 사용
+- `--crop x1,y1,x2,y2`: 화면 일부만 OCR. 예를 들어 세로 숏폼 상단 문구만 읽고 싶으면 `--crop 0.05,0.05,0.95,0.35`
 - `--keep-frames`: OCR에 사용한 PNG 프레임을 보존
 - `--min-similarity`: OCR 노이즈가 있어도 비슷한 화면을 하나로 합칠 기준. 기본값은 `0.6`
 - 기본값으로 후처리가 함께 실행되며, 원치 않으면 `--skip-postprocess`를 사용
 - 기본 설치 상태가 영어(`eng`)만 포함할 수 있으므로, 한글 OCR이 필요하면 `kor` 언어 데이터를 추가로 설치해야 합니다.
+
+노이즈가 많은 SNS/숏폼 화면이라면 아래처럼 상단 텍스트 영역만 잘라서 OCR하면 훨씬 읽기 쉬워집니다.
+
+```bash
+python3 video_ocr.py input.MOV \
+  --output-dir outputs \
+  --lang eng \
+  --scale 3.0 \
+  --min-word-confidence 55 \
+  --crop 0.05,0.05,0.95,0.35
+```

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import csv
+import io
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -19,8 +22,65 @@ class OcrSegment:
     normalized: str
 
 
+@dataclass
+class OcrLine:
+    text: str
+    confidence: float
+
+
 TIME_LINE_RE = re.compile(r"^\d{1,2}:\d{2}\s*(?:AM|PM)?$", re.IGNORECASE)
 TIME_TOKEN_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)?\b", re.IGNORECASE)
+COUNT_TOKEN_RE = re.compile(r"^\d[\d.,]*(?:[kmb])?$", re.IGNORECASE)
+AGE_TOKEN_RE = re.compile(r"^\d+[smhdwy]$", re.IGNORECASE)
+WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9#@']+")
+UI_KEYWORD_PATTERNS = (
+    "reply to",
+    "liked by",
+    "follow",
+    "following",
+    "ago",
+    "views",
+    "comments",
+    "comment",
+    "others",
+)
+OCR_CHAR_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "—": "-",
+        "–": "-",
+        "…": "...",
+        "•": " ",
+        "|": " ",
+        "¦": " ",
+        "®": " ",
+        "©": " ",
+    }
+)
+ENGLISH_CHAR_WHITELIST = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789"
+    " .,!?:;'\"()-/%&@#+"
+)
+
+
+def parse_crop_arg(value: str) -> tuple[float, float, float, float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("--crop 형식은 x1,y1,x2,y2 여야 합니다.")
+    try:
+        x1, y1, x2, y2 = (float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--crop 값은 0~1 사이 숫자여야 합니다.") from exc
+    if not all(0.0 <= part <= 1.0 for part in (x1, y1, x2, y2)):
+        raise argparse.ArgumentTypeError("--crop 값은 0~1 사이여야 합니다.")
+    if x1 >= x2 or y1 >= y2:
+        raise argparse.ArgumentTypeError("--crop 에서는 x1<x2, y1<y2 여야 합니다.")
+    return (x1, y1, x2, y2)
 
 
 def parse_args():
@@ -58,6 +118,12 @@ def parse_args():
         help="OCR 전에 프레임 확대 배율 (기본: 2.0)",
     )
     parser.add_argument(
+        "--crop",
+        type=parse_crop_arg,
+        default=None,
+        help="OCR할 영역 비율 x1,y1,x2,y2 (예: 0.05,0.08,0.95,0.35)",
+    )
+    parser.add_argument(
         "--min-similarity",
         type=float,
         default=0.6,
@@ -68,6 +134,17 @@ def parse_args():
         type=int,
         default=4,
         help="유효 텍스트로 간주할 최소 글자 수(공백 제외) (기본: 4)",
+    )
+    parser.add_argument(
+        "--min-word-confidence",
+        type=float,
+        default=50.0,
+        help="TSV OCR에서 유지할 최소 단어 confidence (0~100, 기본: 50)",
+    )
+    parser.add_argument(
+        "--char-whitelist",
+        default=None,
+        help="Tesseract 허용 문자 목록. 미지정 시 영어 OCR에서 기본 ASCII 집합 사용",
     )
     parser.add_argument(
         "--keep-frames",
@@ -165,18 +242,39 @@ def probe_duration(video_path: Path) -> Optional[float]:
         return None
 
 
-def build_filter(interval: float, scale: float) -> str:
+def build_filter(
+    interval: float,
+    scale: float,
+    crop: Optional[tuple[float, float, float, float]],
+) -> str:
     filters = [f"fps=1/{interval}"]
+    if crop is not None:
+        x1, y1, x2, y2 = crop
+        filters.append(
+            "crop="
+            f"iw*{x2 - x1:.6f}:"
+            f"ih*{y2 - y1:.6f}:"
+            f"iw*{x1:.6f}:"
+            f"ih*{y1:.6f}"
+        )
     if scale != 1.0:
         filters.append(
             f"scale=trunc(iw*{scale}/2)*2:trunc(ih*{scale}/2)*2:flags=lanczos"
         )
     filters.append("format=gray")
+    filters.append("eq=contrast=1.25:brightness=0.03")
+    filters.append("unsharp=5:5:1.0:5:5:0.0")
     return ",".join(filters)
 
 
-def extract_frames(video_path: Path, frames_dir: Path, interval: float, scale: float) -> list[Path]:
-    filter_expr = build_filter(interval, scale)
+def extract_frames(
+    video_path: Path,
+    frames_dir: Path,
+    interval: float,
+    scale: float,
+    crop: Optional[tuple[float, float, float, float]],
+) -> list[Path]:
+    filter_expr = build_filter(interval, scale, crop)
     output_pattern = frames_dir / "frame_%06d.png"
     try:
         subprocess.run(
@@ -208,10 +306,28 @@ def extract_frames(video_path: Path, frames_dir: Path, interval: float, scale: f
     return frames
 
 
-def clean_ocr_text(text: str) -> str:
+def uses_english_only_constraints(lang: str) -> bool:
+    requested = {part.strip().lower() for part in lang.split("+") if part.strip()}
+    return bool(requested) and requested <= {"eng", "osd"}
+
+
+def normalize_ocr_fragment(text: str, english_only: bool) -> str:
+    normalized = unicodedata.normalize("NFKC", text).translate(OCR_CHAR_TRANSLATION)
+    if english_only:
+        normalized = "".join(
+            ch for ch in normalized if ch in ENGLISH_CHAR_WHITELIST or ch.isspace()
+        )
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
+    normalized = re.sub(r"([(\[{])\s+", r"\1", normalized)
+    normalized = re.sub(r"\s+([)\]}])", r"\1", normalized)
+    return normalized.strip(" |-_~")
+
+
+def clean_ocr_text(text: str, english_only: bool = False) -> str:
     lines = []
     for line in text.splitlines():
-        normalized = " ".join(line.split()).strip(" |-_")
+        normalized = normalize_ocr_fragment(line, english_only=english_only)
         if sum(ch.isalnum() for ch in normalized) >= 3:
             lines.append(normalized)
     return "\n".join(lines)
@@ -246,29 +362,141 @@ def text_quality(text: str) -> tuple[int, int]:
     return (len(comparison_key(text)), len(text))
 
 
-def ocr_frame(frame_path: Path, lang: str, psm: int) -> str:
+def join_ocr_tokens(tokens: list[str]) -> str:
+    line = " ".join(tokens)
+    line = re.sub(r"\s+([,.;:!?])", r"\1", line)
+    line = re.sub(r"([(\[{])\s+", r"\1", line)
+    line = re.sub(r"\s+([)\]}])", r"\1", line)
+    return line.strip()
+
+
+def parse_confidence(raw: str) -> float:
     try:
-        result = subprocess.run(
-            [
-                "tesseract",
-                str(frame_path),
-                "stdout",
-                "-l",
-                lang,
-                "--psm",
-                str(psm),
-                "quiet",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+        return float(raw)
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def extract_ocr_lines(
+    tsv_text: str,
+    min_word_confidence: float,
+    english_only: bool,
+) -> list[OcrLine]:
+    lines: list[OcrLine] = []
+    current_key: Optional[tuple[str, str, str]] = None
+    current_tokens: list[str] = []
+    current_confidences: list[float] = []
+    reader = csv.DictReader(io.StringIO(tsv_text), delimiter="\t")
+
+    def flush_line() -> None:
+        if not current_tokens:
+            return
+        line_text = join_ocr_tokens(current_tokens)
+        if not line_text:
+            return
+        confidence = (
+            sum(current_confidences) / len(current_confidences)
+            if current_confidences
+            else min_word_confidence
         )
+        lines.append(OcrLine(text=line_text, confidence=confidence))
+
+    for row in reader:
+        if row.get("level") != "5":
+            continue
+
+        key = (
+            row.get("block_num", ""),
+            row.get("par_num", ""),
+            row.get("line_num", ""),
+        )
+        if current_key is None:
+            current_key = key
+        elif key != current_key:
+            flush_line()
+            current_key = key
+            current_tokens = []
+            current_confidences = []
+
+        confidence = parse_confidence(row.get("conf"))
+        token = normalize_ocr_fragment(row.get("text", ""), english_only=english_only)
+        if not token:
+            continue
+        if confidence >= 0 and confidence < min_word_confidence:
+            continue
+
+        current_tokens.append(token)
+        if confidence >= 0:
+            current_confidences.append(confidence)
+
+    flush_line()
+    return lines
+
+
+def run_tesseract(
+    frame_path: Path,
+    lang: str,
+    psm: int,
+    char_whitelist: Optional[str],
+    tsv: bool,
+) -> str:
+    cmd = [
+        "tesseract",
+        str(frame_path),
+        "stdout",
+        "-l",
+        lang,
+        "--psm",
+        str(psm),
+    ]
+    if char_whitelist:
+        cmd.extend(["-c", f"tessedit_char_whitelist={char_whitelist}"])
+    cmd.extend(["tsv", "quiet"] if tsv else ["quiet"])
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     except FileNotFoundError as exc:
         raise RuntimeError("tesseract를 찾을 수 없습니다. 먼저 설치하세요.") from exc
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip()
         raise RuntimeError(f"OCR 실패 ({frame_path.name}):\n{stderr}") from exc
-    return clean_ocr_text(result.stdout)
+    return result.stdout
+
+
+def ocr_frame(
+    frame_path: Path,
+    lang: str,
+    psm: int,
+    min_word_confidence: float,
+    char_whitelist: Optional[str],
+) -> str:
+    english_only = uses_english_only_constraints(lang)
+    effective_whitelist = char_whitelist or (
+        ENGLISH_CHAR_WHITELIST if english_only else None
+    )
+    tsv_text = run_tesseract(
+        frame_path,
+        lang=lang,
+        psm=psm,
+        char_whitelist=effective_whitelist,
+        tsv=True,
+    )
+    lines = extract_ocr_lines(
+        tsv_text,
+        min_word_confidence=min_word_confidence,
+        english_only=english_only,
+    )
+    if lines:
+        return "\n".join(line.text for line in lines)
+
+    fallback_text = run_tesseract(
+        frame_path,
+        lang=lang,
+        psm=psm,
+        char_whitelist=effective_whitelist,
+        tsv=False,
+    )
+    return clean_ocr_text(fallback_text, english_only=english_only)
 
 
 def to_srt_timestamp(seconds: float) -> str:
@@ -308,10 +536,32 @@ def similarity(left: str, right: str) -> float:
 def split_lines(text: str) -> list[str]:
     lines = []
     for line in text.splitlines():
-        collapsed = " ".join(line.split()).strip(" |-_~")
+        collapsed = normalize_ocr_fragment(line, english_only=False)
         if collapsed:
             lines.append(collapsed)
     return lines
+
+
+def tokenize_line_words(line: str) -> list[str]:
+    tokens = []
+    for token in WORD_TOKEN_RE.findall(line.casefold()):
+        cleaned = token.lstrip("#@")
+        if cleaned:
+            tokens.append(cleaned)
+    return tokens
+
+
+def word_looks_implausible(word: str) -> bool:
+    letters = "".join(ch for ch in word.casefold() if ch.isalpha())
+    if len(letters) <= 2:
+        return False
+    if not re.search(r"[aeiouy]", letters) and len(letters) >= 4:
+        return True
+    if re.search(r"[^aeiouy]{5,}", letters):
+        return True
+    if any(ch.islower() for ch in word) and sum(ch.isupper() for ch in word[1:]) >= 2:
+        return True
+    return False
 
 
 def line_is_low_signal(line: str) -> bool:
@@ -320,10 +570,43 @@ def line_is_low_signal(line: str) -> bool:
         return True
     if TIME_LINE_RE.match(line):
         return True
+
+    folded = line.casefold()
     symbol_count = sum(1 for ch in line if not ch.isalnum() and not ch.isspace())
+    symbol_ratio = symbol_count / len(line) if line else 0.0
+    digit_count = sum(1 for ch in line if ch.isdigit())
+    letter_count = sum(1 for ch in line if ch.isalpha())
+    tokens = tokenize_line_words(line)
+    alpha_tokens = [token for token in tokens if any(ch.isalpha() for ch in token)]
+    count_tokens = [token for token in tokens if COUNT_TOKEN_RE.fullmatch(token)]
+
     if TIME_TOKEN_RE.search(line) and len(normalized) <= 10:
         return True
-    if line and symbol_count / len(line) > 0.35 and len(normalized) < 10:
+    if any(AGE_TOKEN_RE.fullmatch(token) for token in tokens) and "ago" in tokens:
+        return True
+    if any(token.endswith("ollow") for token in tokens):
+        return True
+    if any(pattern in folded for pattern in UI_KEYWORD_PATTERNS):
+        if len(normalized) <= 32 or count_tokens:
+            return True
+    if count_tokens and len(alpha_tokens) <= 3 and len(normalized) < 24:
+        return True
+    if digit_count >= 3 and digit_count >= max(letter_count, 1) and len(alpha_tokens) <= 2:
+        return True
+    if (
+        len(alpha_tokens) == 1
+        and len(normalized) < 8
+        and alpha_tokens[0].islower()
+    ):
+        return True
+    implausible_count = sum(1 for token in alpha_tokens if word_looks_implausible(token))
+    if implausible_count >= max(1, len(alpha_tokens) - 1) and symbol_ratio > 0.12:
+        return True
+    if line.endswith("...") and len(alpha_tokens) <= 4:
+        return True
+    if line and symbol_ratio > 0.35 and len(normalized) < 10:
+        return True
+    if symbol_ratio > 0.18 and len(alpha_tokens) <= 2:
         return True
     return False
 
@@ -339,8 +622,14 @@ def line_looks_like_ui_chrome(line: str, index: int, total_lines: int) -> bool:
 
     symbol_count = sum(1 for ch in line if not ch.isalnum() and not ch.isspace())
     symbol_ratio = symbol_count / len(line) if line else 0.0
+    tokens = tokenize_line_words(line)
+    count_tokens = [token for token in tokens if COUNT_TOKEN_RE.fullmatch(token)]
 
     if TIME_TOKEN_RE.search(line) and len(normalized) <= 16:
+        return True
+    if count_tokens and len(tokens) <= 4:
+        return True
+    if any(pattern in line.casefold() for pattern in UI_KEYWORD_PATTERNS) and len(normalized) <= 28:
         return True
     if symbol_ratio > 0.18 and len(normalized) <= 24:
         return True
@@ -350,6 +639,9 @@ def line_looks_like_ui_chrome(line: str, index: int, total_lines: int) -> bool:
 
 
 def detect_ui_chrome(segments: list[OcrSegment], repeat_threshold: float) -> set[str]:
+    if len(segments) < 3:
+        return set()
+
     top_counts: dict[str, int] = {}
     bottom_counts: dict[str, int] = {}
     total = max(len(segments), 1)
@@ -367,10 +659,10 @@ def detect_ui_chrome(segments: list[OcrSegment], repeat_threshold: float) -> set
 
     chrome = set()
     for key, count in top_counts.items():
-        if count / total >= repeat_threshold:
+        if count >= 2 and count / total >= repeat_threshold:
             chrome.add(key)
     for key, count in bottom_counts.items():
-        if count / total >= repeat_threshold:
+        if count >= 2 and count / total >= repeat_threshold:
             chrome.add(key)
     return chrome
 
@@ -435,6 +727,8 @@ def merge_segments(
     lang: str,
     psm: int,
     min_chars: int,
+    min_word_confidence: float,
+    char_whitelist: Optional[str],
     min_similarity: float,
     duration: Optional[float],
 ) -> list[OcrSegment]:
@@ -445,7 +739,13 @@ def merge_segments(
         if total <= 10 or index % 10 == 0 or index == total - 1:
             print(f"  OCR 진행: {index + 1}/{total}")
 
-        raw_text = ocr_frame(frame_path, lang=lang, psm=psm)
+        raw_text = ocr_frame(
+            frame_path,
+            lang=lang,
+            psm=psm,
+            min_word_confidence=min_word_confidence,
+            char_whitelist=char_whitelist,
+        )
         if not is_useful_text(raw_text, min_chars=min_chars):
             continue
 
@@ -564,6 +864,9 @@ def main() -> int:
     if args.scale <= 0:
         print("--scale 은 0보다 커야 합니다.", file=sys.stderr)
         return 1
+    if not (0.0 <= args.min_word_confidence <= 100.0):
+        print("--min-word-confidence 는 0과 100 사이여야 합니다.", file=sys.stderr)
+        return 1
     if not (0.0 <= args.min_similarity <= 1.0):
         print("--min-similarity 는 0과 1 사이여야 합니다.", file=sys.stderr)
         return 1
@@ -612,8 +915,19 @@ def main() -> int:
 
     try:
         try:
-            print(f"[1/4] 프레임 추출: interval={args.interval}s, scale={args.scale}x")
-            frames = extract_frames(input_path, frames_dir=frames_dir, interval=args.interval, scale=args.scale)
+            crop_text = (
+                f", crop={','.join(f'{value:.2f}' for value in args.crop)}"
+                if args.crop is not None
+                else ""
+            )
+            print(f"[1/4] 프레임 추출: interval={args.interval}s, scale={args.scale}x{crop_text}")
+            frames = extract_frames(
+                input_path,
+                frames_dir=frames_dir,
+                interval=args.interval,
+                scale=args.scale,
+                crop=args.crop,
+            )
 
             print(f"[2/4] OCR 수행: frames={len(frames)}, lang={args.lang}, psm={args.psm}")
             segments = merge_segments(
@@ -622,6 +936,8 @@ def main() -> int:
                 lang=args.lang,
                 psm=args.psm,
                 min_chars=args.min_chars,
+                min_word_confidence=args.min_word_confidence,
+                char_whitelist=args.char_whitelist,
                 min_similarity=args.min_similarity,
                 duration=duration,
             )
