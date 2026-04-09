@@ -117,7 +117,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="비디오 파일에서 음성을 추출해 Whisper로 자막/텍스트를 생성합니다."
     )
-    parser.add_argument("input", type=Path, help="입력 비디오 파일 경로 (mov/mp4 등)")
+    parser.add_argument("input", type=Path, nargs="+", help="입력 비디오 파일 경로 (여러 파일 가능, glob 패턴 지원)")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -155,15 +155,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    in_path = args.input.resolve()
-    if not in_path.exists():
-        print(f"입력 파일이 없습니다: {in_path}", file=sys.stderr)
-        return 1
-
-    out_dir = args.output_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+def transcribe_single_file(in_path: Path, model, args, out_dir: Path) -> int:
     stem = in_path.stem
 
     wav_path = out_dir / f"{stem}.wav"
@@ -171,13 +163,11 @@ def main():
     timed_txt_path = out_dir / f"{stem}.timed.txt"
     srt_path = out_dir / f"{stem}.srt"
     vtt_path = out_dir / f"{stem}.vtt"
-    WhisperModel = load_whisper_model_class()
 
-    print(f"[1/3] 음성 추출: {in_path.name}")
+    print(f"  [1/3] 음성 추출: {in_path.name}")
     ffmpeg_extract_audio(in_path, wav_path)
 
-    print(f"[2/3] 음성 인식: model={args.model_size}, device={args.device}")
-    model = WhisperModel(args.model_size, device=args.device, compute_type=args.compute_type)
+    print(f"  [2/3] 음성 인식")
     segments_gen, info = model.transcribe(
         str(wav_path),
         language=args.language,
@@ -187,10 +177,10 @@ def main():
     segments = list(segments_gen)
 
     print(
-        f"  감지 언어={info.language}, 확률={info.language_probability:.2f}, 세그먼트={len(segments)}"
+        f"    감지 언어={info.language}, 확률={info.language_probability:.2f}, 세그먼트={len(segments)}"
     )
 
-    print("[3/3] 결과 저장")
+    print(f"  [3/3] 결과 저장")
     write_txt(segments, txt_path)
     write_timestamped_txt(segments, timed_txt_path)
     write_srt(segments, srt_path)
@@ -199,13 +189,46 @@ def main():
     if not args.keep_audio and wav_path.exists():
         wav_path.unlink()
 
-    print(f"- TXT: {txt_path}")
-    print(f"- Timed TXT: {timed_txt_path}")
-    print(f"- SRT: {srt_path}")
-    print(f"- VTT: {vtt_path}")
-    if args.keep_audio:
-        print(f"- WAV: {wav_path}")
+    print(f"  - TXT: {txt_path}")
+    print(f"  - SRT: {srt_path}")
+    print(f"  - VTT: {vtt_path}")
     return 0
+
+
+def main():
+    args = parse_args()
+
+    input_files: list[Path] = []
+    for pattern in args.input:
+        resolved = pattern.resolve()
+        if resolved.exists() and resolved.is_file():
+            input_files.append(resolved)
+        else:
+            globbed = list(pattern.parent.glob(pattern.name))
+            input_files.extend(p.resolve() for p in globbed if p.is_file())
+
+    if not input_files:
+        print("입력 파일이 없습니다.", file=sys.stderr)
+        return 1
+
+    out_dir = args.output_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"모델 로딩: model={args.model_size}, device={args.device}")
+    WhisperModel = load_whisper_model_class()
+    model = WhisperModel(args.model_size, device=args.device, compute_type=args.compute_type)
+
+    failed = 0
+    for idx, in_path in enumerate(input_files, start=1):
+        print(f"\n[{idx}/{len(input_files)}] {in_path.name}")
+        try:
+            transcribe_single_file(in_path, model, args, out_dir)
+        except Exception as err:
+            print(f"  오류: {err}", file=sys.stderr)
+            failed += 1
+
+    print(f"\n완료: {len(input_files) - failed}/{len(input_files)}개 성공")
+    return 1 if failed == len(input_files) else 0
 
 
 if __name__ == "__main__":

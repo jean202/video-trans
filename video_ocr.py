@@ -87,7 +87,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="비디오 프레임에서 화면 문자열을 OCR로 추출합니다."
     )
-    parser.add_argument("input", type=Path, help="입력 비디오 파일 경로 (mov/mp4 등)")
+    parser.add_argument("input", type=Path, nargs="+", help="입력 비디오 파일 경로 (여러 파일 가능, glob 패턴 지원)")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -877,11 +877,6 @@ def main() -> int:
         print("--postprocess-merge-similarity 는 0과 1 사이여야 합니다.", file=sys.stderr)
         return 1
 
-    input_path = args.input.resolve()
-    if not input_path.exists():
-        print(f"입력 파일이 없습니다: {input_path}", file=sys.stderr)
-        return 1
-
     try:
         ensure_binary("ffmpeg")
         ensure_binary("ffprobe")
@@ -892,8 +887,36 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    input_files: list[Path] = []
+    for pattern in args.input:
+        resolved = pattern.resolve()
+        if resolved.exists() and resolved.is_file():
+            input_files.append(resolved)
+        else:
+            globbed = list(pattern.parent.glob(pattern.name))
+            input_files.extend(p.resolve() for p in globbed if p.is_file())
+
+    if not input_files:
+        print("입력 파일이 없습니다.", file=sys.stderr)
+        return 1
+
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    failed = 0
+    for file_idx, input_path in enumerate(input_files, start=1):
+        print(f"\n[{file_idx}/{len(input_files)}] {input_path.name}")
+        try:
+            _ocr_single_file(input_path, args, output_dir)
+        except Exception as err:
+            print(f"  오류: {err}", file=sys.stderr)
+            failed += 1
+
+    print(f"\n완료: {len(input_files) - failed}/{len(input_files)}개 성공")
+    return 1 if failed == len(input_files) else 0
+
+
+def _ocr_single_file(input_path: Path, args, output_dir: Path) -> None:
     stem = input_path.stem
     txt_path = output_dir / f"{stem}.ocr.txt"
     timed_txt_path = output_dir / f"{stem}.ocr.timed.txt"
@@ -914,70 +937,60 @@ def main() -> int:
         frames_dir = Path(temp_dir_ctx.name)
 
     try:
-        try:
-            crop_text = (
-                f", crop={','.join(f'{value:.2f}' for value in args.crop)}"
-                if args.crop is not None
-                else ""
-            )
-            print(f"[1/4] 프레임 추출: interval={args.interval}s, scale={args.scale}x{crop_text}")
-            frames = extract_frames(
-                input_path,
-                frames_dir=frames_dir,
-                interval=args.interval,
-                scale=args.scale,
-                crop=args.crop,
-            )
+        crop_text = (
+            f", crop={','.join(f'{value:.2f}' for value in args.crop)}"
+            if args.crop is not None
+            else ""
+        )
+        print(f"  [1/4] 프레임 추출: interval={args.interval}s, scale={args.scale}x{crop_text}")
+        frames = extract_frames(
+            input_path,
+            frames_dir=frames_dir,
+            interval=args.interval,
+            scale=args.scale,
+            crop=args.crop,
+        )
 
-            print(f"[2/4] OCR 수행: frames={len(frames)}, lang={args.lang}, psm={args.psm}")
-            segments = merge_segments(
-                frames=frames,
-                interval=args.interval,
-                lang=args.lang,
-                psm=args.psm,
-                min_chars=args.min_chars,
-                min_word_confidence=args.min_word_confidence,
-                char_whitelist=args.char_whitelist,
-                min_similarity=args.min_similarity,
-                duration=duration,
+        print(f"  [2/4] OCR 수행: frames={len(frames)}, lang={args.lang}, psm={args.psm}")
+        segments = merge_segments(
+            frames=frames,
+            interval=args.interval,
+            lang=args.lang,
+            psm=args.psm,
+            min_chars=args.min_chars,
+            min_word_confidence=args.min_word_confidence,
+            char_whitelist=args.char_whitelist,
+            min_similarity=args.min_similarity,
+            duration=duration,
+        )
+
+        print(f"  [3/4] 원본 OCR 저장: segments={len(segments)}")
+        write_txt(segments, txt_path)
+        write_timed_txt(segments, timed_txt_path)
+        write_srt(segments, srt_path)
+
+        if args.skip_postprocess:
+            print("  [4/4] 후처리 건너뜀")
+        else:
+            cleaned_segments = postprocess_segments(
+                segments,
+                ui_repeat_threshold=args.ui_repeat_threshold,
+                merge_similarity=args.postprocess_merge_similarity,
             )
-
-            print(f"[3/4] 원본 OCR 저장: segments={len(segments)}")
-            write_txt(segments, txt_path)
-            write_timed_txt(segments, timed_txt_path)
-            write_srt(segments, srt_path)
-
-            if args.skip_postprocess:
-                print("[4/4] 후처리 건너뜀")
-            else:
-                cleaned_segments = postprocess_segments(
-                    segments,
-                    ui_repeat_threshold=args.ui_repeat_threshold,
-                    merge_similarity=args.postprocess_merge_similarity,
-                )
-                print(f"[4/4] 후처리 저장: cleaned_segments={len(cleaned_segments)}")
-                write_txt(cleaned_segments, cleaned_txt_path)
-                write_timed_txt(cleaned_segments, cleaned_timed_txt_path)
-                write_srt(cleaned_segments, cleaned_srt_path)
-                write_gpt_prompt(cleaned_segments, gpt_prompt_path)
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+            print(f"  [4/4] 후처리 저장: cleaned_segments={len(cleaned_segments)}")
+            write_txt(cleaned_segments, cleaned_txt_path)
+            write_timed_txt(cleaned_segments, cleaned_timed_txt_path)
+            write_srt(cleaned_segments, cleaned_srt_path)
+            write_gpt_prompt(cleaned_segments, gpt_prompt_path)
     finally:
         if temp_dir_ctx is not None:
             temp_dir_ctx.cleanup()
 
-    print(f"- TXT: {txt_path}")
-    print(f"- Timed TXT: {timed_txt_path}")
-    print(f"- SRT: {srt_path}")
+    print(f"  - TXT: {txt_path}")
+    print(f"  - SRT: {srt_path}")
     if not args.skip_postprocess:
-        print(f"- Cleaned TXT: {cleaned_txt_path}")
-        print(f"- Cleaned Timed TXT: {cleaned_timed_txt_path}")
-        print(f"- Cleaned SRT: {cleaned_srt_path}")
-        print(f"- GPT Prompt: {gpt_prompt_path}")
-    if args.keep_frames:
-        print(f"- Frames: {frames_dir}")
-    return 0
+        print(f"  - Cleaned SRT: {cleaned_srt_path}")
+        print(f"  - GPT Prompt: {gpt_prompt_path}")
 
 
 if __name__ == "__main__":
