@@ -1,2 +1,34 @@
 YCchat.MOV
 *ScreenRecording*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Whisper model cache
+~/.cache/huggingface/
+models/
+
+# Extracted audio (intermediate files)
+*.wav
+
+# Video files (except sample)
+*.mp4
+*.mov
+*.MOV
+*.avi
+*.mkv
+
+# Tesseract frame extracts
+frames/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
